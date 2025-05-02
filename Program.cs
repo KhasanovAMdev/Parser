@@ -27,34 +27,27 @@ namespace RealEstateAnalysis
         {
             Console.WriteLine("=== Анализ рынка недвижимости Ульяновска ===");
 
-            // 1. Парсинг данных
             Console.WriteLine("\n[1/6] Парсинг данных с Avito...");
-            var apartments = await ParseAvito("ulyanovsk", pages: 3, useSavedHtml: true);
+            var apartments = await ParseAvito("ulyanovsk", pages: 5, useSavedHtml: true);
 
-            // Фильтрация некорректных данных
             apartments = apartments.Where(a =>
                 a.Price > 0 && a.Square > 0 && a.Rooms > 0 && a.Floor > 0
             ).ToList();
 
             Console.WriteLine($"Получено {apartments.Count} объявлений после фильтрации");
 
-            // 2. Сохранение в CSV
             Console.WriteLine("\n[2/6] Сохранение данных в CSV...");
             SaveToCsv(apartments, "apartments.csv");
 
-            // 3. Описательная статистика
             Console.WriteLine("\n[3/6] Расчет описательной статистики...");
             CalculateDescriptiveStats(apartments);
 
-            // 4. Визуализация данных
             Console.WriteLine("\n[4/6] Визуализация данных...");
             GeneratePlots(apartments);
 
-            // 5. Корреляционный анализ
             Console.WriteLine("\n[5/6] Корреляционный анализ...");
             CalculateCorrelations(apartments);
 
-            // 6. Регрессионный анализ
             Console.WriteLine("\n[6/6] Построение регрессионной модели...");
             BuildRegressionModel(apartments);
 
@@ -86,24 +79,17 @@ namespace RealEstateAnalysis
                         string url = $"https://www.avito.ru/{city}/kvartiry/prodam/vtorichka-ASgBAQICAUSSA8YQAUDmBxSMUg?p={page}";
                         html = await httpClient.GetStringAsync(url);
 
-                        // Сохраняем HTML для отладки
                         await File.WriteAllTextAsync(debugFileName, html);
                         Console.WriteLine($"Страница сохранена в {debugFileName}");
 
-                        // Добавляем случайную задержку
                         await Task.Delay(Random.Shared.Next(2000, 5000));
                     }
 
                     var doc = new HtmlDocument();
                     doc.LoadHtml(html);
 
-                    // Проверяем, не блокирует ли Avito парсинг
                     if (doc.DocumentNode.InnerHtml.Contains("Доступ ограничен"))
                     {
-                        Console.WriteLine("Обнаружена блокировка Avito. Попробуйте:");
-                        Console.WriteLine("1. Использовать прокси");
-                        Console.WriteLine("2. Увеличить задержки между запросами");
-                        Console.WriteLine("3. Проверить User-Agent");
                         break;
                     }
 
@@ -111,12 +97,6 @@ namespace RealEstateAnalysis
 
                     if (nodes.Count == 0)
                     {
-                        Console.WriteLine("Объявления не найдены. Возможные причины:");
-                        Console.WriteLine("1. Изменилась структура сайта");
-                        Console.WriteLine("2. Сработала защита от парсинга");
-                        Console.WriteLine("3. Нет результатов по запросу");
-
-                        // Сохраняем HTML для анализа
                         File.WriteAllText($"error_debug_page_{page}.html", html);
                         Console.WriteLine($"Ошибка сохранена в error_debug_page_{page}.html");
                         break;
@@ -321,12 +301,12 @@ namespace RealEstateAnalysis
         static void PrintStats(string name, List<double> values)
         {
             Console.WriteLine($"\n{name}:");
-            Console.WriteLine($"• Среднее: {values.Mean():0.##}");
-            Console.WriteLine($"• Медиана: {values.Median():0.##}");
-            Console.WriteLine($"• Стандартное отклонение: {values.StandardDeviation():0.##}");
-            Console.WriteLine($"• Минимум: {values.Min():0.##}");
-            Console.WriteLine($"• Максимум: {values.Max():0.##}");
-            Console.WriteLine($"• Квартили (25%/50%/75%): {values.Quantile(0.25):0.##} / {values.Quantile(0.5):0.##} / {values.Quantile(0.75):0.##}");
+            Console.WriteLine($"Среднее: {values.Mean():0.##}");
+            Console.WriteLine($"Медиана: {values.Median():0.##}");
+            Console.WriteLine($"Стандартное отклонение: {values.StandardDeviation():0.##}");
+            Console.WriteLine($"Минимум: {values.Min():0.##}");
+            Console.WriteLine($"Максимум: {values.Max():0.##}");
+            Console.WriteLine($"Квартили (25%/50%/75%): {values.Quantile(0.25):0.##} / {values.Quantile(0.5):0.##} / {values.Quantile(0.75):0.##}");
         }
 
         static void GeneratePlots(List<ApartmentData> apartments)
@@ -392,6 +372,26 @@ namespace RealEstateAnalysis
         {
             try
             {
+                string GetDistrictGroup(string fullAddress)
+                {
+                    if (string.IsNullOrEmpty(fullAddress))
+                        return "Не указан";
+
+                    var address = fullAddress.Split(',')[0].Trim();
+
+                    if (address.StartsWith("мкр-н"))
+                        return address.Replace("мкр-н", "").Trim();
+
+    
+                    if (address.StartsWith("пр-т"))
+                        return address.Replace("пр-т", "").Trim();
+
+                    if (address.StartsWith("ул."))
+                        return address.Replace("ул.", "").Trim();
+
+                    return address;
+                }
+
                 var mlContext = new MLContext(seed: 42);
 
                 var trainingData = apartments.Select(a => new ApartmentTrainingData
@@ -400,12 +400,14 @@ namespace RealEstateAnalysis
                     Square = a.Square,
                     Rooms = (float)a.Rooms,
                     Floor = (float)a.Floor,
-                    District = a.District ?? "Не указан"
+                    District = GetDistrictGroup(a.District)
                 }).ToList();
 
-    
-                var data = mlContext.Data.LoadFromEnumerable(trainingData);
+                var uniqueDistricts = trainingData.Select(d => d.District).Distinct().ToList();
+                Console.WriteLine($"Уникальных районов после группировки: {uniqueDistricts.Count}");
+                Console.WriteLine("Примеры районов: " + string.Join(", ", uniqueDistricts.Take(5)) + "...");
 
+                var data = mlContext.Data.LoadFromEnumerable(trainingData);
 
                 var pipeline = mlContext.Transforms
                     .Categorical.OneHotEncoding("DistrictEncoded", "District")
@@ -420,9 +422,8 @@ namespace RealEstateAnalysis
                         labelColumnName: "Label",
                         featureColumnName: "Features"));
 
-   
                 var trainTestSplit = mlContext.Data.TrainTestSplit(data, testFraction: 0.2);
-   
+
                 var model = pipeline.Fit(trainTestSplit.TrainSet);
 
                 var predictions = model.Transform(trainTestSplit.TestSet);
@@ -441,9 +442,9 @@ namespace RealEstateAnalysis
                 var prediction = predictionEngine.Predict(sample);
 
                 Console.WriteLine("\nПример прогноза:");
-                Console.WriteLine($"• Реальная цена: {sample.Label:N0} руб.");
-                Console.WriteLine($"• Прогнозируемая: {prediction.PredictedPrice:N0} руб.");
-                Console.WriteLine($"• Параметры: {sample.Square} м², {sample.Rooms}к, этаж {sample.Floor}, район: {sample.District}");
+                Console.WriteLine($"Реальная цена: {sample.Label:N0} руб.");
+                Console.WriteLine($"Прогнозируемая: {prediction.PredictedPrice:N0} руб.");
+                Console.WriteLine($"Параметры: {sample.Square} м², {sample.Rooms}к, этаж {sample.Floor}, район: {sample.District}");
 
                 mlContext.Model.Save(model, data.Schema, "real_estate_model.zip");
                 Console.WriteLine("\nМодель сохранена в файл: real_estate_model.zip");
@@ -461,7 +462,7 @@ namespace RealEstateAnalysis
         public class ApartmentTrainingData
         {
             [LoadColumn(0)]
-            public float Label { get; set; } 
+            public float Label { get; set; }
 
             [LoadColumn(1)]
             public float Square { get; set; }
