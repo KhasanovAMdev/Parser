@@ -3,6 +3,7 @@ using HtmlAgilityPack;
 using MathNet.Numerics.Statistics;
 using Microsoft.ML;
 using Microsoft.ML.Data;
+using Microsoft.ML.Trainers.FastTree;
 using ScottPlot;
 using System.Globalization;
 using System.Net;
@@ -48,8 +49,8 @@ namespace RealEstateAnalysis
             Console.WriteLine("\n[5/6] Корреляционный анализ...");
             CalculateCorrelations(apartments);
 
-            Console.WriteLine("\n[6/6] Построение регрессионной модели...");
-            BuildRegressionModel(apartments);
+            Console.WriteLine("\n[6/6] Построение прогнозирующих моделей...");
+            BuildModels(apartments);
 
             Console.WriteLine("\nАнализ завершен! Результаты сохранены в папке с программой.");
         }
@@ -186,7 +187,7 @@ namespace RealEstateAnalysis
 
                                 if (apartment.Square == 0)
                                 {
-                                    var squareMatch = Regex.Match(paramsText, @"(\d+[.,]\d+|\d+)\s*м²");
+                                    var squareMatch = Regex.Match(paramsText, @"(\d+[.,]\d+|\d+)\s*м^2");
                                     if (squareMatch.Success)
                                     {
                                         apartment.Square = float.Parse(squareMatch.Groups[1].Value.Replace(",", "."),
@@ -293,7 +294,7 @@ namespace RealEstateAnalysis
             Console.WriteLine("\n=== Описательная статистика ===");
 
             PrintStats("Цены (руб)", prices);
-            PrintStats("Площадь (м²)", squares);
+            PrintStats("Площадь (м^2)", squares);
             PrintStats("Количество комнат", rooms);
             PrintStats("Этаж", floors);
         }
@@ -331,11 +332,11 @@ namespace RealEstateAnalysis
                 // Зависимость цены от площади
                 var plt2 = new Plot();
                 plt2.Title("Зависимость цены от площади");
-                plt2.XLabel("Площадь (м²)");
+                plt2.XLabel("Площадь (м^2)");
                 plt2.YLabel("Цена (млн руб)");
                 var sp = plt2.Add.ScatterPoints(apartments.Select(a => (double)a.Square).ToArray(), prices);
                 sp.MarkerSize = 10;
-                plt2.SavePng("price_vs_area.png",800,600);
+                plt2.SavePng("price_vs_area.png", 800, 600);
             }
             catch (Exception ex)
             {
@@ -368,32 +369,27 @@ namespace RealEstateAnalysis
             }
         }
 
-        static void BuildRegressionModel(List<ApartmentData> apartments)
+        static void BuildModels(List<ApartmentData> apartments)
         {
             try
             {
+                // Функция предобработки районов
                 string GetDistrictGroup(string fullAddress)
                 {
-                    if (string.IsNullOrEmpty(fullAddress))
-                        return "Не указан";
-
+                    if (string.IsNullOrEmpty(fullAddress)) return "Не указан";
                     var address = fullAddress.Split(',')[0].Trim();
-
-                    if (address.StartsWith("мкр-н"))
-                        return address.Replace("мкр-н", "").Trim();
-
-    
-                    if (address.StartsWith("пр-т"))
-                        return address.Replace("пр-т", "").Trim();
-
-                    if (address.StartsWith("ул."))
-                        return address.Replace("ул.", "").Trim();
-
-                    return address;
+                    return address switch
+                    {
+                        string s when s.StartsWith("мкр-н") => s.Replace("мкр-н", "").Trim(),
+                        string s when s.StartsWith("пр-т") => s.Replace("пр-т", "").Trim(),
+                        string s when s.StartsWith("ул.") => s.Replace("ул.", "").Trim(),
+                        _ => address
+                    };
                 }
 
                 var mlContext = new MLContext(seed: 42);
 
+                // Подготовка данных
                 var trainingData = apartments.Select(a => new ApartmentTrainingData
                 {
                     Label = a.Price,
@@ -403,51 +399,91 @@ namespace RealEstateAnalysis
                     District = GetDistrictGroup(a.District)
                 }).ToList();
 
-                var uniqueDistricts = trainingData.Select(d => d.District).Distinct().ToList();
-                Console.WriteLine($"Уникальных районов после группировки: {uniqueDistricts.Count}");
-                Console.WriteLine("Примеры районов: " + string.Join(", ", uniqueDistricts.Take(5)) + "...");
-
                 var data = mlContext.Data.LoadFromEnumerable(trainingData);
-
-                var pipeline = mlContext.Transforms
-                    .Categorical.OneHotEncoding("DistrictEncoded", "District")
-                    .Append(mlContext.Transforms.Concatenate(
-                        "Features",
-                        nameof(ApartmentTrainingData.Square),
-                        nameof(ApartmentTrainingData.Rooms),
-                        nameof(ApartmentTrainingData.Floor),
-                        "DistrictEncoded")
-                    )
-                    .Append(mlContext.Regression.Trainers.LbfgsPoissonRegression(
-                        labelColumnName: "Label",
-                        featureColumnName: "Features"));
-
                 var trainTestSplit = mlContext.Data.TrainTestSplit(data, testFraction: 0.2);
 
-                var model = pipeline.Fit(trainTestSplit.TrainSet);
+                // Список моделей для сравнения
+                var models = new List<(string Name, IEstimator<ITransformer> Pipeline)>
+        {
+            ("Poisson Regression", mlContext.Regression.Trainers.LbfgsPoissonRegression()),
+            ("Fast Tree", mlContext.Regression.Trainers.FastTree()),
+            ("Fast Forest", mlContext.Regression.Trainers.FastForest()),
+            ("Online Gradient Descent", mlContext.Regression.Trainers.OnlineGradientDescent()),
+            ("LightGBM", mlContext.Regression.Trainers.LightGbm())
+        };
 
-                var predictions = model.Transform(trainTestSplit.TestSet);
-                var metrics = mlContext.Regression.Evaluate(predictions,
-                    labelColumnName: "Label",
-                    scoreColumnName: "Score");
+                var results = new List<ModelResult>();
 
-                Console.WriteLine("\n=== Регрессионная модель ===");
-                Console.WriteLine($"R²: {metrics.RSquared:0.###}");
-                Console.WriteLine($"RMSE: {metrics.RootMeanSquaredError:0.###} руб.");
-                Console.WriteLine($"MAE: {metrics.MeanAbsoluteError:0.###} руб.");
+                // Обучение и оценка всех моделей
+                foreach (var model in models)
+                {
+                    var pipeline = mlContext.Transforms
+                        .Categorical.OneHotEncoding("DistrictEncoded", "District")
+                        .Append(mlContext.Transforms.NormalizeMinMax(
+                            outputColumnName: "NormalizedSquare",
+                            inputColumnName: nameof(ApartmentTrainingData.Square)))
+                        .Append(mlContext.Transforms.NormalizeMinMax(
+                            outputColumnName: "NormalizedRooms",
+                            inputColumnName: nameof(ApartmentTrainingData.Rooms)))
+                        .Append(mlContext.Transforms.NormalizeMinMax(
+                            outputColumnName: "NormalizedFloor",
+                            inputColumnName: nameof(ApartmentTrainingData.Floor)))
+                        .Append(mlContext.Transforms.Concatenate(
+                            "Features",
+                            "NormalizedSquare",
+                            "NormalizedRooms",
+                            "NormalizedFloor",
+                            "DistrictEncoded"))
+                        .Append(model.Pipeline);
 
-                var predictionEngine = mlContext.Model.CreatePredictionEngine<ApartmentTrainingData, PricePrediction>(model);
+                    Console.WriteLine($"\nОбучение модели: {model.Name}...");
 
+                    var trainedModel = pipeline.Fit(trainTestSplit.TrainSet);
+                    var predictions = trainedModel.Transform(trainTestSplit.TestSet);
+                    var metrics = mlContext.Regression.Evaluate(predictions, "Label", "Score");
+
+                    results.Add(new ModelResult(
+                        model.Name,
+                        trainedModel,
+                        metrics.RSquared,
+                        metrics.RootMeanSquaredError,
+                        metrics.MeanAbsoluteError
+                    ));
+
+                    Console.WriteLine($"Метрики {model.Name}:");
+                    Console.WriteLine($"R^2: {metrics.RSquared:0.000}, RMSE: {metrics.RootMeanSquaredError:0.0}, MAE: {metrics.MeanAbsoluteError:0.0}");
+                }
+
+                // Выбор лучшей модели по R^2
+                var bestModel = results.OrderByDescending(r => r.RSquared).First();
+
+                Console.WriteLine("\n=== Лучшая модель ===");
+                Console.WriteLine($"Название: {bestModel.Name}");
+                Console.WriteLine($"R^2: {bestModel.RSquared:0.000}");
+                Console.WriteLine($"RMSE: {bestModel.RMSE:0.0} руб.");
+                Console.WriteLine($"MAE: {bestModel.MAE:0.0} руб.");
+
+                // Сохранение лучшей модели
+                mlContext.Model.Save(bestModel.Model, data.Schema, "best_real_estate_model.zip");
+                Console.WriteLine("\nЛучшая модель сохранена в файл: best_real_estate_model.zip");
+
+                // Пример прогноза лучшей модели
+                var predictionEngine = mlContext.Model.CreatePredictionEngine<ApartmentTrainingData, PricePrediction>(bestModel.Model);
                 var sample = trainingData[Random.Shared.Next(trainingData.Count)];
-                var prediction = predictionEngine.Predict(sample);
+                var prediction = predictionEngine.Predict(sample); 
 
-                Console.WriteLine("\nПример прогноза:");
+                Console.WriteLine("\nПример прогноза лучшей модели:");
                 Console.WriteLine($"Реальная цена: {sample.Label:N0} руб.");
                 Console.WriteLine($"Прогнозируемая: {prediction.PredictedPrice:N0} руб.");
-                Console.WriteLine($"Параметры: {sample.Square} м², {sample.Rooms}к, этаж {sample.Floor}, район: {sample.District}");
+                Console.WriteLine($"Параметры: {sample.Square} м^2, {sample.Rooms}к, этаж {sample.Floor}, район: {sample.District}");
 
-                mlContext.Model.Save(model, data.Schema, "real_estate_model.zip");
-                Console.WriteLine("\nМодель сохранена в файл: real_estate_model.zip");
+                // Вывод сравнения всех моделей
+                Console.WriteLine("\nСравнение моделей:");
+                Console.WriteLine(" Модель / R^2 / RMSE / MAE ");
+                foreach (var result in results.OrderByDescending(r => r.RSquared))
+                {
+                    Console.WriteLine($" {result.Name,-26} / {result.RSquared:0.000} / {result.RMSE:9.0} руб. / {result.MAE:9.0} руб. ");
+                }
             }
             catch (Exception ex)
             {
@@ -456,6 +492,25 @@ namespace RealEstateAnalysis
                 {
                     Console.WriteLine($"Внутренняя ошибка: {ex.InnerException.Message}");
                 }
+            }
+        }
+
+        // Класс для хранения результатов моделей
+        public class ModelResult
+        {
+            public string Name { get; }
+            public ITransformer Model { get; }
+            public double RSquared { get; }
+            public double RMSE { get; }
+            public double MAE { get; }
+
+            public ModelResult(string name, ITransformer model, double rSquared, double rmse, double mae)
+            {
+                Name = name;
+                Model = model;
+                RSquared = rSquared;
+                RMSE = rmse;
+                MAE = mae;
             }
         }
 
